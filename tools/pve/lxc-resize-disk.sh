@@ -28,6 +28,7 @@ set -Eeuo pipefail
 export PERL_BADLANG=0
 
 LOGFILE="/var/log/lxc-resize.log"
+META_DIR="/opt/lxc-resize-meta"
 
 # =============================================================================
 # Logging
@@ -575,19 +576,19 @@ validate_inputs() {
   local target_size=$3
 
   if ! pct status "$ctid" >/dev/null 2>&1; then
-    echo "Error: Container $ctid does not exist."
+    msg_error "Container $ctid does not exist."
     return 1
   fi
 
   local config_line
   config_line=$(pct config "$ctid" 2>/dev/null | awk "/^${disk_key}:/ {print}")
   if [[ -z "$config_line" ]]; then
-    echo "Error: Disk '$disk_key' not found in container $ctid."
+    msg_error "Disk '$disk_key' not found in container $ctid."
     return 1
   fi
 
   if ! [[ "$target_size" =~ ^[0-9]+(\.[0-9]+)?[KMGTPkmgtp]?$ ]]; then
-    echo "Error: Invalid size format '$target_size'. Use e.g. 3G, 500M, 1500MB, or a bare number for GB."
+    msg_error "Invalid size format '$target_size'. Use e.g. 3G, 500M, 1500MB, or a bare number for GB."
     return 1
   fi
 
@@ -597,19 +598,19 @@ validate_inputs() {
   new_bytes=$(parse_size_to_bytes "$target_size")
 
   if ((new_bytes == 0)); then
-    echo "Error: Target size resolves to 0 bytes."
+    msg_error "Target size resolves to 0 bytes."
     return 1
   fi
 
   # Target must be strictly less than current max (we are shrinking)
   if ((new_bytes >= max_bytes)) && ((max_bytes > 0)); then
-    echo "Error: Target size ($(bytes_to_human "$new_bytes")) must be less than current size ($(bytes_to_human "$max_bytes"))."
+    msg_error "Target size ($(bytes_to_human "$new_bytes")) must be less than current size ($(bytes_to_human "$max_bytes"))."
     return 1
   fi
 
   # Target must be strictly greater than used space
   if ((new_bytes <= used_bytes)) && ((used_bytes > 0)); then
-    echo "Error: Target size ($(bytes_to_human "$new_bytes")) must be greater than used space ($(bytes_to_human "$used_bytes"))."
+    msg_error "Target size ($(bytes_to_human "$new_bytes")) must be greater than used space ($(bytes_to_human "$used_bytes"))."
     return 1
   fi
 
@@ -917,9 +918,7 @@ resize_zfs_subvol() {
     if ((pct_diff > 5)); then
       msg_error "Size mismatch: expected ${target_size}, got ${actual_size}"
       log "VERIFY_FAIL size_mismatch expected=$target_size actual=$actual_size"
-      echo -e "${YW}${TAB}Would you like to retry with dd copy instead? (y/N)${CL}"
-      read -rp "${TAB}Choice: " dd_retry
-      if [[ "$dd_retry" =~ ^[Yy]$ ]]; then
+      if prompt_confirm "Would you like to retry with dd copy instead?" "n" 60; then
         msg_info "Falling back to dd copy approach..."
         log "FALLBACK_DD"
         return 1  # Signal caller to fall through to dd approach
@@ -1159,7 +1158,7 @@ while [[ $# -gt 0 ]]; do
     -y | --yes) AUTO_YES=1; shift ;;
     -r | --rollback) AUTO_ROLLBACK=1; shift ;;
     -h | --help) show_help; exit 0 ;;
-    *) echo "Unknown option: $1"; exit 1 ;;
+    *) msg_error "Unknown option: $1"; exit 1 ;;
   esac
 done
 
