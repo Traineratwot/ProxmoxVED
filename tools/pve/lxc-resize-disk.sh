@@ -8,26 +8,26 @@
 # ZFS subvolumes.  Supports both interactive (whiptail) and non-interactive
 # (CLI) modes.
 
-set -eEuo pipefail
+# Source community helpers
+if command -v curl >/dev/null 2>&1; then
+  source <(curl -fsSL ${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/core.func)
+  source <(curl -fsSL ${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/lib/tools.func)
+  source <(curl -fsSL ${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/error_handler.func)
+elif command -v wget >/dev/null 2>&1; then
+  source <(wget -qO- ${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/core.func)
+  source <(wget -qO- ${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/lib/tools.func)
+  source <(wget -qO- ${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/error_handler.func)
+else
+  echo "curl or wget is required" >&2
+  exit 1
+fi
+load_functions
+catch_errors
+
+set -Eeuo pipefail
 export PERL_BADLANG=0
 
-# =============================================================================
-# Constants and color codes
-# =============================================================================
-
-BL="\033[36m"
-RD="\033[01;31m"
-GN="\033[1;92m"
-YW="\033[33m"
-CL="\033[m"
-TAB="  "
-CM="${TAB}✔${TAB}"
-
 LOGFILE="/var/log/lxc-resize.log"
-
-msg_info() { echo -e "${BL}[Info]${GN} $1${CL}"; }
-msg_ok()   { echo -e "${GN}${TAB}${CM}${CL} ${GN}$1${CL}"; }
-msg_error(){ echo -e "${RD}[Error]${CL} $1"; }
 
 # =============================================================================
 # Logging
@@ -78,64 +78,17 @@ function header_info() {
 EOF
 }
 
-# Display a spinner animation while a background process runs.
-# Usage: spinner $PID "Message"
-spinner() {
+# Show community spinner while waiting for a background PID to finish.
+# Usage: pct stop "$ctid" &; spin_wait $! "Stopping container"
+spin_wait() {
   local pid=$1
   local msg=${2:-"Working"}
-  local delay=0.1
-  local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-  while ps -p "$pid" >/dev/null 2>&1; do
-    echo -ne "\r\033[36m[Info]\033[1;92m ${msg}... ${spinstr:0:1}\033[m"
-    spinstr=${spinstr#?}${spinstr%"${spinstr#?}"}
-    sleep "$delay"
-  done
-  echo -ne "\r\033[K"
-}
-
-# Run a command in the background with a spinner and report success/failure.
-run_with_spinner() {
-  local msg=$1
-  shift
-  msg_info "${msg}..."
-  log "SPINNER $msg"
-  "$@" &
-  local pid=$!
-  spinner "$pid" "$msg"
+  SPINNER_MSG="$msg"
+  spinner &
+  local spid=$!
+  SPINNER_PID=$spid
   wait "$pid"
-  local rc=$?
-  if [[ $rc -eq 0 ]]; then
-    msg_ok "${msg} — done"
-    log "DONE $msg"
-  else
-    msg_error "${msg} — failed (exit $rc)"
-    log "FAIL $msg exit=$rc"
-  fi
-  return $rc
-}
-
-# Stream progress percentages from stdin and render a visual progress bar.
-# Used by dd's status=progress output piped into this function.
-progress_bar() {
-  local label=$1
-  local total=$2
-  local current=0
-  local width=40
-  msg_info "${label}..."
-  log "PROGRESS_START $label total=$total"
-  while IFS= read -r line; do
-    local pct
-    pct=$(echo "$line" | grep -oP '\d+(?=%)' || echo "0")
-    if [[ -n "$pct" && "$pct" -gt "$current" ]] 2>/dev/null; then
-      current=$pct
-      local filled=$((current * width / 100))
-      local empty=$((width - filled))
-      printf "\r  [${GN}%${filled}s${CL}%${empty}s${CL}] ${current}%%" | tr ' ' '█' | tr ' ' '░'
-    fi
-  done
-  printf "\r\033[K"
-  msg_ok "${label} — done"
-  log "PROGRESS_DONE $label"
+  stop_spinner
 }
 
 # =============================================================================
@@ -182,12 +135,6 @@ bytes_to_human() {
 get_storage_type() {
   local storage="$1"
   pvesm status | awk -v st="$storage" '$1 == st {print $2}'
-}
-
-# Return the absolute path for a Proxmox volume reference (e.g. "local-lvm:vm-100-disk-0").
-get_volume_path() {
-  local vol="$1"
-  pvesm path "$vol" 2>/dev/null
 }
 
 # Parse /etc/pve/storage.cfg and return the ZFS pool name for a given storage ID.
@@ -381,6 +328,13 @@ create_new_volume() {
       local new_vol="vm-${ctid}-disk-new.raw"
       local storage_path
       storage_path=$(pvesm path "${storage}:${new_vol}" 2>/dev/null)
+      if [[ -z "$storage_path" ]]; then
+        local pvesm_error
+        pvesm_error=$(pvesm path "${storage}:${new_vol}" 2>&1) || true
+        msg_error "Failed to resolve path for new volume: ${pvesm_error}"
+        log "ERROR pvesm_path storage=$storage vol=$new_vol error=$pvesm_error"
+        return 1
+      fi
       mkdir -p "$(dirname "$storage_path")"
       truncate -s "${new_size}" "$storage_path"
       echo "${storage}:${new_vol}"
@@ -447,7 +401,17 @@ copy_data() {
 
   local bs count
   read -r bs count <<< "$(get_dd_params "$source_size")"
-  dd if="$source_dev" of="$dest_dev" bs="$bs" count="$count" status=progress 2>&1
+  local dd_errors
+  dd_errors=$(mktemp)
+  dd if="$source_dev" of="$dest_dev" bs="$bs" count="$count" status=progress 2>"$dd_errors"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    cat "$dd_errors" >&2
+    rm -f "$dd_errors"
+    return $rc
+  fi
+  rm -f "$dd_errors"
+  return 0
 }
 
 # Compare MD5 checksums of source and destination to detect corruption.
@@ -467,6 +431,9 @@ verify_checksum() {
   if [[ "$source_hash" == "$dest_hash" ]]; then
     return 0
   else
+    msg_error "Source hash: ${source_hash}"
+    msg_error "Dest hash:   ${dest_hash}"
+    log "CHECKSUM_MISMATCH src=$source_hash dst=$dest_hash"
     return 1
   fi
 }
@@ -892,7 +859,7 @@ resize_zfs_subvol() {
   log "STEP1_STOPPING ctid=$ctid"
   if [[ "$(pct status "$ctid" 2>/dev/null)" == "status: running" ]]; then
     pct stop "$ctid" &
-    spinner $! "Stopping container"
+    spin_wait $! "Stopping container"
   fi
   msg_ok "Container stopped"
   log "STEP1_OK"
@@ -901,7 +868,7 @@ resize_zfs_subvol() {
   msg_info "Step 2/4: Setting refquota to ${target_size}..."
   log "STEP2_REFQUOTA ds=$zfs_ds size=$target_size"
   zfs set refquota="${target_size}" "$zfs_ds" &
-  spinner $! "Setting refquota"
+  spin_wait $! "Setting refquota"
   msg_ok "refquota updated"
   log "STEP2_OK refquota=$target_size"
 
@@ -909,7 +876,7 @@ resize_zfs_subvol() {
   msg_info "Step 3/4: Starting container..."
   log "STEP3_STARTING ctid=$ctid"
   pct start "$ctid" &
-  spinner $! "Starting container"
+  spin_wait $! "Starting container"
   sleep 5
   msg_ok "Container started"
   log "STEP3_OK"
@@ -1006,7 +973,7 @@ resize_via_dd() {
   log "STEP2_STOPPING ctid=$ctid"
   if [[ "$(pct status "$ctid" 2>/dev/null)" == "status: running" ]]; then
     pct stop "$ctid" &
-    spinner $! "Stopping container"
+    spin_wait $! "Stopping container"
   fi
   msg_ok "Container stopped"
   log "STEP2_OK"
@@ -1033,8 +1000,11 @@ resize_via_dd() {
   log "STEP3_COPY src=$source_dev dst=$dest_dev bytes=$source_bytes"
 
   if ! copy_data "$source_dev" "$dest_dev" "$source_bytes"; then
-    msg_error "Error: Data copy failed"
-    log "ERROR copy_data failed"
+    local copy_rc=$?
+    msg_error "Error: Data copy failed (exit code: ${copy_rc})"
+    msg_error "Source: ${source_dev} ($(bytes_to_human "$source_bytes"))"
+    msg_error "Dest: ${dest_dev} (${target_size})"
+    log "ERROR copy_data failed src=$source_dev dst=$dest_dev rc=$copy_rc"
     rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
     return 1
   fi
@@ -1065,7 +1035,7 @@ resize_via_dd() {
   msg_info "Step 6/7: Starting container..."
   log "STEP6_STARTING ctid=$ctid"
   pct start "$ctid" &
-  spinner $! "Starting container"
+  spin_wait $! "Starting container"
   sleep 3
   msg_ok "Container started"
   log "STEP6_OK"

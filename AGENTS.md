@@ -1,3 +1,5 @@
+
+
 # 🤖 AI Contribution Guidelines for ProxmoxVED
 
 > **This documentation is intended for all AI assistants (GitHub Copilot, Claude, ChatGPT, etc.) contributing to this project.**
