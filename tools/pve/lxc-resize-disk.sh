@@ -89,15 +89,17 @@ trap trap_exit INT TERM
 # 5. UI HELPERS
 # =============================================================================
 
-function header_info() {
-  [[ -t 1 ]] && clear
+# Override community header_info — don't require TERM or header file
+function header_info {
+  clear
   cat <<"EOF"
-    _   ___  ________   ____       __     __
-   / | / / / /_  __/  / __ \___  / /__  / /____
-  /  |/ / / / / /    / / / / _ \/ / _ \/ __/ _ \
- / /|  / /_/ / /    / /_/ /  __/ /  __/ /_/  __/
-/_/ |_/\____/_/    /____/\___/_/\___/\__/\___/
-            DISK RESIZE
+______          _           _     __   _______
+| ___ \        (_)         | |    \ \ / /  __ \
+| |_/ /___  ___ _ _______  | |     \ V /| /  \/
+|    // _ \/ __| |_  / _ \ | |     /   \| |
+| |\ \  __/\__ \ |/ /  __/ | |____/ /^\ \ \__/\
+\_| \_\___||___/_/___\___| \_____/\/   \/\____/
+
 EOF
 }
 
@@ -284,7 +286,7 @@ get_used_bytes() {
   local ctid=$1
   local disk_key=$2
   local used
-  used=$(pct_dsk "$ctid" | awk -v dk="$disk_key" '$1 == dk {print $4}')
+  used=$(pct_dsk "$ctid" 2>/dev/null | awk -v dk="$disk_key" '$1 == dk {print $4}' || true)
   if [[ -n "$used" ]]; then
     parse_size_to_bytes "$used"
   else
@@ -983,6 +985,177 @@ resize_zfs_subvol() {
   fi
 }
 
+# Resize ext4 by creating a fresh filesystem and copying files.
+# This avoids ext4 metadata mismatch issues with dd.
+# Returns 0 on success, 1 on failure.
+resize_via_copy() {
+  local ctid=$1
+  local disk_key=$2
+  local target_size=$3
+  local storage=$4
+  local vol_name=$5
+  local current_size=$6
+  local old_vol="${storage}:${vol_name}"
+
+  msg_info "Using file copy approach (ext4)"
+  log "MODE=copy old_vol=$old_vol"
+
+  local dest_bytes
+  dest_bytes=$(parse_size_to_bytes "$target_size")
+
+  # Step 1: Create new volume of TARGET size
+  msg_info "Step 1/7: Creating new volume..."
+  log "STEP1_CREATE_VOL ctid=$ctid disk=$disk_key target=$target_size"
+  local new_vol
+  new_vol=$(create_new_volume "$ctid" "$disk_key" "$target_size")
+  if [[ -z "$new_vol" ]]; then
+    msg_error "Error: Failed to create new volume"
+    log "ERROR create_new_volume failed"
+    return 1
+  fi
+  msg_ok "New volume created: ${new_vol}"
+  log "STEP1_OK new_vol=$new_vol"
+
+  # Step 2: Stop the container
+  msg_info "Step 2/7: Stopping container..."
+  log "STEP2_STOPPING ctid=$ctid"
+  stop_ct "$ctid" || {
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  }
+  msg_ok "Container stopped"
+  log "STEP2_OK"
+
+  # Step 3: Format new volume and copy files
+  msg_info "Step 3/7: Formatting and copying data..."
+  local source_dev dest_dev
+  source_dev=$(get_device_path "$old_vol")
+  dest_dev=$(get_device_path "$new_vol")
+
+  if [[ -z "$source_dev" || -z "$dest_dev" ]]; then
+    msg_error "Error: Could not resolve device paths"
+    log "ERROR device_path source=$source_dev dest=$dest_dev"
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  fi
+
+  # Pre-copy check: verify used data fits in destination
+  local used_bytes
+  used_bytes=$(get_used_bytes "$ctid" "$disk_key")
+  if ((used_bytes > dest_bytes)); then
+    msg_error "Used data ($(bytes_to_human "$used_bytes")) exceeds target size ($(bytes_to_human "$dest_bytes"))"
+    log "ERROR used_exceeds_target used=$used_bytes target=$dest_bytes"
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  fi
+
+  # Create ext4 filesystem on destination
+  mkfs.ext4 -F -q "$dest_dev" >/dev/null 2>&1
+  log "STEP3_MKFS dst=$dest_dev"
+
+  # Mount both and copy
+  local src_mnt="/mnt/.resize_src_$$"
+  local dst_mnt="/mnt/.resize_dst_$$"
+  mkdir -p "$src_mnt" "$dst_mnt"
+
+  if ! mount -o ro "$source_dev" "$src_mnt" 2>/dev/null; then
+    msg_error "Error: Failed to mount source filesystem"
+    log "ERROR mount_source src=$source_dev"
+    rmdir "$src_mnt" "$dst_mnt" 2>/dev/null || true
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  fi
+
+  if ! mount "$dest_dev" "$dst_mnt" 2>/dev/null; then
+    msg_error "Error: Failed to mount destination filesystem"
+    log "ERROR mount_dest dst=$dest_dev"
+    umount "$src_mnt" 2>/dev/null || true
+    rmdir "$src_mnt" "$dst_mnt" 2>/dev/null || true
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  fi
+
+  log "STEP3_MOUNT src=$src_mnt dst=$dst_mnt"
+
+  # Copy files preserving permissions, ownership, timestamps
+  if ! cp -a "$src_mnt"/. "$dst_mnt"/ 2>/dev/null; then
+    msg_error "Error: File copy failed"
+    log "ERROR cp_failed"
+    umount "$dst_mnt" 2>/dev/null || true
+    umount "$src_mnt" 2>/dev/null || true
+    rmdir "$src_mnt" "$dst_mnt" 2>/dev/null || true
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  fi
+
+  umount "$dst_mnt" 2>/dev/null || true
+  umount "$src_mnt" 2>/dev/null || true
+  rmdir "$src_mnt" "$dst_mnt" 2>/dev/null || true
+
+  msg_ok "Data copied"
+  log "STEP3_OK"
+
+  # Step 4: Verify — check file count matches
+  msg_info "Step 4/7: Verifying data..."
+  log "STEP4_VERIFY"
+  mkdir -p "$src_mnt" "$dst_mnt"
+  mount -o ro "$source_dev" "$src_mnt" 2>/dev/null
+  mount "$dest_dev" "$dst_mnt" 2>/dev/null
+
+  local src_files dst_files
+  src_files=$(find "$src_mnt" -type f 2>/dev/null | wc -l)
+  dst_files=$(find "$dst_mnt" -type f 2>/dev/null | wc -l)
+
+  umount "$dst_mnt" 2>/dev/null || true
+  umount "$src_mnt" 2>/dev/null || true
+  rmdir "$src_mnt" "$dst_mnt" 2>/dev/null || true
+
+  if [[ "$src_files" -ne "$dst_files" ]]; then
+    msg_error "Error: File count mismatch — source: ${src_files}, dest: ${dst_files}"
+    log "ERROR file_count_mismatch src=$src_files dst=$dst_files"
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  fi
+  msg_ok "Verified: ${dst_files} files"
+  log "STEP4_OK files=$dst_files"
+
+  # Step 5: Replace volume in config
+  msg_info "Step 5/7: Replacing volume in config..."
+  log "STEP5_REPLACE ctid=$ctid disk=$disk_key new=$new_vol size=$target_size"
+  save_rollback_metadata "$ctid" "$disk_key" "$old_vol" "$new_vol" "$current_size"
+  replace_volume_in_config "$ctid" "$disk_key" "$new_vol" "$target_size"
+  msg_ok "Volume replaced"
+  log "STEP5_OK"
+
+  # Step 6: Start container
+  msg_info "Step 6/7: Starting container..."
+  log "STEP6_STARTING ctid=$ctid"
+  start_ct "$ctid"
+  msg_ok "Container started"
+  log "STEP6_OK"
+
+  # Step 7: Verify health
+  msg_info "Step 7/7: Verifying container health..."
+  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
+    msg_ok "Container is running"
+    log "STEP7_OK status=running"
+  else
+    msg_error "Warning: Container is not running after start"
+    log "STEP7_WARN status=$(pct_st "$ctid")"
+  fi
+
+  log "SUCCESS CTID=$ctid DISK_KEY=$disk_key OLD=$current_size NEW=$target_size OLD_VOL=$old_vol NEW_VOL=$new_vol MODE=copy"
+
+  if [[ "${AUTO_ROLLBACK:-0}" -eq 1 ]]; then
+    msg_info "Auto-rollback requested, reverting to original..."
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+  else
+    post_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+  fi
+
+  return 0
+}
+
 resize_via_dd() {
   local ctid=$1
   local disk_key=$2
@@ -1052,7 +1225,8 @@ resize_via_dd() {
   echo -e "${TAB}Dest:   ${dest_dev} (${target_size})"
   log "STEP3_COPY src=$source_dev dst=$dest_dev src_bytes=$source_bytes dst_bytes=$dest_bytes"
 
-  if ! copy_data "$source_dev" "$dest_dev" "$source_bytes"; then
+  # Copy only dest_bytes — dd stops at file boundary
+  if ! copy_data "$source_dev" "$dest_dev" "$dest_bytes"; then
     local copy_rc=$?
     msg_error "Error: Data copy failed (exit code: ${copy_rc})"
     msg_error "Source: ${source_dev} ($(bytes_to_human "$source_bytes"))"
@@ -1064,10 +1238,10 @@ resize_via_dd() {
   msg_ok "Data copied"
   log "STEP3_OK"
 
-  # Step 4: Verify checksum
+  # Step 4: Verify checksum (compare only dest_bytes to avoid size mismatch)
   msg_info "Step 4/7: Verifying checksum..."
   log "STEP4_CHECKSUM src=$source_dev dst=$dest_dev"
-  if ! verify_checksum "$source_dev" "$dest_dev" "$source_bytes"; then
+  if ! verify_checksum "$source_dev" "$dest_dev" "$dest_bytes"; then
     msg_error "Error: Checksum mismatch — data corruption detected"
     log "ERROR checksum_mismatch"
     rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
@@ -1137,15 +1311,29 @@ do_resize() {
 
   local rc=0
 
+  # Algorithm 1: ZFS refquota
   if [[ "$stype" == "zfspool" ]]; then
     msg_info "Probing ZFS dataset..."
     if resize_zfs_subvol "$ctid" "$disk_key" "$target_size" "$storage" "$vol_name" "$current_size"; then
       allow_interrupts
       return 0
     fi
-    msg_info "ZFS zvol or refquota fallback — switching to dd copy"
+    msg_info "ZFS zvol or refquota fallback — switching to file copy"
   fi
 
+  # Algorithm 2: ext4 file copy (avoids metadata mismatch)
+  local old_vol="${storage}:${vol_name}"
+  local source_dev
+  source_dev=$(get_device_path "$old_vol")
+  if [[ -n "$source_dev" ]] && file "$source_dev" 2>/dev/null | grep -q "ext[234]"; then
+    msg_info "Detected ext[234] filesystem — using file copy approach"
+    resize_via_copy "$ctid" "$disk_key" "$target_size" "$storage" "$vol_name" "$current_size"
+    rc=$?
+    allow_interrupts
+    return $rc
+  fi
+
+  # Algorithm 3: dd copy (fallback for everything else)
   resize_via_dd "$ctid" "$disk_key" "$target_size" "$storage" "$vol_name" "$current_size"
   rc=$?
 
