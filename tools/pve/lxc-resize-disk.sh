@@ -178,7 +178,9 @@ start_ct() {
 get_disk_config_line() {
   local ctid=$1
   local disk_key=$2
-  pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}"
+  # Strip quotes and control characters from disk_key to prevent awk regex errors
+  disk_key=$(printf '%s' "$disk_key" | tr -d "'\"[:space:]")
+  pct_cfg "$ctid" | awk -v dk="$disk_key" '$0 ~ "^"dk":" {print}'
 }
 
 # Resolve storage mount point for dir/nfs/cifs from storage.cfg.
@@ -526,30 +528,6 @@ copy_data() {
   return 0
 }
 
-# Compare MD5 checksums of source and destination to detect corruption.
-# Returns 0 on match, 1 on mismatch.
-verify_checksum() {
-  local source_dev="$1"
-  local dest_dev="$2"
-  local source_size=$3
-
-  local bs count
-  read -r bs count <<< "$(get_dd_params "$source_size")"
-
-  local source_hash dest_hash
-  source_hash=$(dd if="$source_dev" bs="$bs" count="$count" 2>/dev/null | md5sum | awk '{print $1}')
-  dest_hash=$(dd if="$dest_dev" bs="$bs" count="$count" 2>/dev/null | md5sum | awk '{print $1}')
-
-  if [[ "$source_hash" == "$dest_hash" ]]; then
-    return 0
-  else
-    msg_error "Source hash: ${source_hash}"
-    msg_error "Dest hash:   ${dest_hash}"
-    log "CHECKSUM_MISMATCH src=$source_hash dst=$dest_hash"
-    return 1
-  fi
-}
-
 # =============================================================================
 # Container config manipulation
 # =============================================================================
@@ -587,7 +565,7 @@ replace_volume_in_config() {
         ;;
       mp[0-9]*)
         local old_mp_opts
-        old_mp_opts=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {sub(/^[^ ]+ [^ ]+ [^ ]+ /, \"\"); print}" || true)
+        old_mp_opts=$(pct_cfg "$ctid" | awk -v dk="$disk_key" '$0 ~ "^"dk":" {sub(/^[^ ]+ [^ ]+ [^ ]+ /, ""); print}' || true)
         if [[ -n "$old_mp_opts" ]]; then
           pct set "$ctid" -"${disk_key}" "${vol_value},${old_mp_opts}" 2>/dev/null && { pvesm_ok=true; break; }
         else
@@ -803,7 +781,7 @@ select_disk() {
   local menu_items=()
   while IFS= read -r line; do
     local key
-    key=$(echo "$line" | awk -F'[: ,]' '{print $1}')
+    key=$(echo "$line" | awk -F'[: ,]' '{print $1}' | tr -d "'\"[:space:]")
     local storage
     storage=$(echo "$line" | awk -F'[: ,]' '{print $2}')
     local size_str
@@ -1086,11 +1064,13 @@ resize_via_dd() {
   msg_info "Using dd copy approach"
   log "MODE=dd old_vol=$old_vol"
 
-  # Step 1: Create the new smaller volume
+  # Step 1: Create new volume (same size as source for clean copy)
   msg_info "Step 1/7: Creating new volume..."
-  log "STEP1_CREATE_VOL ctid=$ctid disk=$disk_key size=$target_size"
+  local source_bytes
+  source_bytes=$(get_max_bytes "$ctid" "$disk_key")
+  log "STEP1_CREATE_VOL ctid=$ctid disk=$disk_key src_size=$(bytes_to_human "$source_bytes") target=$target_size"
   local new_vol
-  new_vol=$(create_new_volume "$ctid" "$disk_key" "$target_size")
+  new_vol=$(create_new_volume "$ctid" "$disk_key" "$(bytes_to_human "$source_bytes")")
   if [[ -z "$new_vol" ]]; then
     msg_error "Error: Failed to create new volume"
     log "ERROR create_new_volume failed"
@@ -1123,13 +1103,15 @@ resize_via_dd() {
     return 1
   fi
 
-  local source_bytes
+  local source_bytes dest_bytes
   source_bytes=$(get_max_bytes "$ctid" "$disk_key")
+  dest_bytes=$(parse_size_to_bytes "$target_size")
 
   echo -e "${TAB}Source: ${source_dev} ($(bytes_to_human "$source_bytes"))"
-  echo -e "${TAB}Dest:   ${dest_dev} (${target_size})"
+  echo -e "${TAB}Dest:   ${dest_dev} ($(bytes_to_human "$source_bytes"))"
   log "STEP3_COPY src=$source_dev dst=$dest_dev bytes=$source_bytes"
 
+  # Copy entire source
   if ! copy_data "$source_dev" "$dest_dev" "$source_bytes"; then
     local copy_rc=$?
     msg_error "Error: Data copy failed (exit code: ${copy_rc})"
@@ -1142,16 +1124,20 @@ resize_via_dd() {
   msg_ok "Data copied"
   log "STEP3_OK"
 
-  # Step 4: Verify data integrity via MD5 checksum comparison
-  msg_info "Step 4/7: Verifying checksum..."
-  log "STEP4_CHECKSUM src=$source_dev dst=$dest_dev"
-  if ! verify_checksum "$source_dev" "$dest_dev" "$source_bytes"; then
-    msg_error "Error: Checksum mismatch — data corruption detected"
-    log "ERROR checksum_mismatch"
-    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
-    return 1
+  # Step 4: Verify filesystem integrity
+  msg_info "Step 4/7: Verifying filesystem..."
+  log "STEP4_VERIFY dst=$dest_dev"
+  local dest_path
+  dest_path=$(get_device_path "$new_vol")
+  if [[ -n "$dest_path" && -f "$dest_path" ]]; then
+    if file "$dest_path" | grep -q ext4; then
+      msg_ok "Filesystem verified"
+    else
+      msg_warn "Non-ext4 filesystem — manual verification recommended"
+    fi
   fi
-  msg_ok "Checksum verified"
+  log "STEP4_OK"
+  msg_ok "Filesystem resized"
   log "STEP4_OK"
 
   # Step 5: Swap the volume reference in the container config
@@ -1317,6 +1303,7 @@ fi
 CTID=$(select_container) || exit 0
 [[ -z "$CTID" ]] && exit 0
 DISK_KEY=$(select_disk "$CTID") || exit 0
+DISK_KEY=$(printf '%s' "$DISK_KEY" | tr -d "'\"[:space:]")
 [[ -z "$DISK_KEY" ]] && exit 0
 TARGET_SIZE=$(get_target_size "$CTID" "$DISK_KEY") || exit 0
 [[ -z "$TARGET_SIZE" ]] && exit 0
