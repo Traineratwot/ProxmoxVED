@@ -93,6 +93,21 @@ spin_wait() {
 }
 
 # =============================================================================
+# PVE command wrappers
+# =============================================================================
+# Run pct/pvesm as a child process with LC_ALL=C to force clean byte output,
+# then strip CR and control characters. One sanitization point for all callers.
+
+_pct() {
+  LC_ALL=C "$@" 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
+}
+
+pct_cfg()   { _pct pct config "$@"; }
+pct_st()    { _pct pct status "$@"; }
+pct_ls()    { _pct pct list; }
+pct_dsk()   { _pct pct df "$@"; }
+
+# =============================================================================
 # Size conversion helpers
 # =============================================================================
 
@@ -174,7 +189,7 @@ get_volume_name() {
   local ctid=$1
   local disk_key=$2
   local config_line
-  config_line=$(pct config "$ctid" | awk "/^${disk_key}:/ {print}")
+  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
   echo "$config_line" | cut -d: -f3 | cut -d, -f1
 }
 
@@ -185,7 +200,7 @@ get_storage_for_disk() {
   local ctid=$1
   local disk_key=$2
   local config_line
-  config_line=$(pct config "$ctid" | awk "/^${disk_key}:/ {print}")
+  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
   echo "$config_line" | awk -F": " '{print $2}' | cut -d: -f1
 }
 
@@ -194,7 +209,7 @@ get_size_from_config() {
   local ctid=$1
   local disk_key=$2
   local config_line
-  config_line=$(pct config "$ctid" | awk "/^${disk_key}:/ {print}")
+  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
   echo "$config_line" | grep -oP 'size=\K[^ ,]+'
 }
 
@@ -202,9 +217,8 @@ get_size_from_config() {
 get_used_bytes() {
   local ctid=$1
   local disk_key=$2
-  # pct df output columns: MP Volume Size Used Avail Use% Path
   local used
-  used=$(pct df "$ctid" 2>/dev/null | awk -v dk="$disk_key" '$1 == dk {print $4}')
+  used=$(pct_dsk "$ctid" | awk -v dk="$disk_key" '$1 == dk {print $4}')
   if [[ -n "$used" ]]; then
     parse_size_to_bytes "$used"
   else
@@ -286,7 +300,7 @@ get_next_disk_number() {
   local ctid=$1
   local max_disk=-1
   local vol
-  for vol in $(pct config "$ctid" 2>/dev/null | awk -F'[: ,]' '/^(rootfs|mp[0-9]+)/ {print $4}'); do
+  for vol in $(pct_cfg "$ctid" | awk -F'[: ,]' '/^(rootfs|mp[0-9]+)/ {print $4}'); do
     local disk_num
     disk_num=$(echo "$vol" | grep -oP 'disk-\K[0-9]+' || echo "-1")
     if [[ "$disk_num" =~ ^[0-9]+$ ]] && ((disk_num > max_disk)); then
@@ -470,7 +484,7 @@ replace_volume_in_config() {
       ;;
     mp[0-9]*)
       local old_mp_opts
-      old_mp_opts=$(pct config "$ctid" 2>/dev/null | awk "/^${disk_key}:/ {sub(/^[^ ]+ [^ ]+ [^ ]+ /, \"\"); print}" || true)
+      old_mp_opts=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {sub(/^[^ ]+ [^ ]+ [^ ]+ /, \"\"); print}" || true)
       if [[ -n "$old_mp_opts" ]]; then
         pct set "$ctid" -"${disk_key}" "${vol_value},${old_mp_opts}"
       else
@@ -524,7 +538,7 @@ rollback_operation() {
   fi
 
   # Stop the container if it is currently running
-  if [[ "$(pct status "$ctid" 2>/dev/null)" == "status: running" ]]; then
+  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
     pct stop "$ctid"
     sleep 3
   fi
@@ -581,7 +595,7 @@ validate_inputs() {
   fi
 
   local config_line
-  config_line=$(pct config "$ctid" 2>/dev/null | awk "/^${disk_key}:/ {print}")
+  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
   if [[ -z "$config_line" ]]; then
     msg_error "Disk '$disk_key' not found in container $ctid."
     return 1
@@ -623,7 +637,7 @@ validate_inputs() {
 
 # Present a radio-list of all LXC containers and return the selected CTID.
 select_container() {
-  mapfile -t containers < <(pct list | tail -n +2)
+  mapfile -t containers < <(pct_ls | tail -n +2)
 
   if [[ ${#containers[@]} -eq 0 ]]; then
     whiptail --title "LXC Disk Resize" --msgbox "No LXC containers found!" 8 50
@@ -657,7 +671,7 @@ select_container() {
 select_disk() {
   local ctid=$1
   local config_lines
-  config_lines=$(pct config "$ctid" | awk '/^(rootfs|mp[0-9]+):/ {print}')
+  config_lines=$(pct_cfg "$ctid" | awk '/^(rootfs|mp[0-9]+):/ {print}')
 
   if [[ -z "$config_lines" ]]; then
     whiptail --title "LXC Disk Resize" --msgbox "No disks found in container $ctid!" 8 50
@@ -761,7 +775,7 @@ confirm_operation() {
   local target_size=$3
 
   local container_name
-  container_name=$(pct config "$ctid" | awk '/^hostname:/ {print $2}')
+  container_name=$(pct_cfg "$ctid" | awk '/^hostname:/ {print $2}')
   local current_size
   current_size=$(get_size_from_config "$ctid" "$disk_key")
   local storage
@@ -861,7 +875,7 @@ resize_zfs_subvol() {
   # Step 1: Stop the container
   msg_info "Step 1/4: Stopping container..."
   log "STEP1_STOPPING ctid=$ctid"
-  if [[ "$(pct status "$ctid" 2>/dev/null)" == "status: running" ]]; then
+  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
     pct stop "$ctid" &
     spin_wait $! "Stopping container"
   fi
@@ -889,9 +903,9 @@ resize_zfs_subvol() {
   msg_info "Step 4/4: Verifying resize..."
   sleep 2
   local actual_size
-  actual_size=$(pct df "$ctid" 2>/dev/null | awk '$1 == "rootfs" {print $3}')
+  actual_size=$(pct_dsk "$ctid" | awk '$1 == "rootfs" {print $3}')
   local actual_status
-  actual_status=$(pct status "$ctid" 2>/dev/null)
+  actual_status=$(pct_st "$ctid")
 
   if [[ "$actual_status" == "status: running" ]]; then
     msg_ok "Container is running"
@@ -973,7 +987,7 @@ resize_via_dd() {
   # Step 2: Stop the container
   msg_info "Step 2/7: Stopping container..."
   log "STEP2_STOPPING ctid=$ctid"
-  if [[ "$(pct status "$ctid" 2>/dev/null)" == "status: running" ]]; then
+  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
     pct stop "$ctid" &
     spin_wait $! "Stopping container"
   fi
@@ -1044,12 +1058,12 @@ resize_via_dd() {
 
   # Step 7: Verify the container is healthy and running
   msg_info "Step 7/7: Verifying container health..."
-  if [[ "$(pct status "$ctid" 2>/dev/null)" == "status: running" ]]; then
+  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
     msg_ok "Container is running"
     log "STEP7_OK status=running"
   else
     msg_error "Warning: Container is not running after start"
-    log "STEP7_WARN status=$(pct status "$ctid" 2>/dev/null)"
+    log "STEP7_WARN status=$(pct_st "$ctid")"
   fi
 
   log "SUCCESS CTID=$ctid DISK_KEY=$disk_key OLD=$current_size NEW=$target_size OLD_VOL=$old_vol NEW_VOL=$new_vol"
