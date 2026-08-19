@@ -470,7 +470,10 @@ copy_data() {
   read -r bs count <<< "$(get_dd_params "$source_size")"
   local dd_errors
   dd_errors=$(mktemp)
-  dd if="$source_dev" of="$dest_dev" bs="$bs" count="$count" status=progress 2>"$dd_errors"
+  # Run dd in background with spinner, capture stderr separately
+  dd if="$source_dev" of="$dest_dev" bs="$bs" count="$count" status=progress 2>"$dd_errors" &
+  local dd_pid=$!
+  spin_wait $dd_pid "Copying data (dd)"
   local rc=$?
   if [[ $rc -ne 0 ]]; then
     cat "$dd_errors" >&2
@@ -1078,9 +1081,13 @@ resize_via_copy() {
   log "STEP3_MOUNT src=$src_mnt dst=$dst_mnt"
 
   # Copy files preserving permissions, ownership, timestamps
-  if ! cp -a "$src_mnt"/. "$dst_mnt"/ 2>/dev/null; then
-    msg_error "Error: File copy failed"
-    log "ERROR cp_failed"
+  cp -a "$src_mnt"/. "$dst_mnt"/ 2>/dev/null &
+  local cp_pid=$!
+  spin_wait $cp_pid "Copying files"
+  local rc=$?
+  if [[ $rc -ne 0 ]]; then
+    msg_error "Error: File copy failed (exit code: ${rc})"
+    log "ERROR cp_failed rc=$rc"
     umount "$dst_mnt" 2>/dev/null || true
     umount "$src_mnt" 2>/dev/null || true
     rmdir "$src_mnt" "$dst_mnt" 2>/dev/null || true
