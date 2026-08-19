@@ -286,12 +286,36 @@ get_used_bytes() {
   local ctid=$1
   local disk_key=$2
   local used
+
+  # Try pct df first (works when container is running)
   used=$(pct_dsk "$ctid" 2>/dev/null | awk -v dk="$disk_key" '$1 == dk {print $4}' || true)
   if [[ -n "$used" ]]; then
     parse_size_to_bytes "$used"
-  else
-    echo "0"
+    return 0
   fi
+
+  # Fallback: try dumpe2fs on the raw device (works when container is stopped)
+  local vol dev_path
+  vol=$(get_storage_for_disk "$ctid" "$disk_key")
+  vol="${vol}:$(get_volume_name "$ctid" "$disk_key")"
+  dev_path=$(get_device_path "$vol")
+  if [[ -n "$dev_path" && -f "$dev_path" ]]; then
+    local free_blocks block_size
+    free_blocks=$(dumpe2fs -h "$dev_path" 2>/dev/null | awk '/Free blocks:/{print $3}' || true)
+    block_size=$(dumpe2fs -h "$dev_path" 2>/dev/null | awk '/Block size:/{print $3}' || true)
+    if [[ -n "$free_blocks" && -n "$block_size" && "$free_blocks" =~ ^[0-9]+$ && "$block_size" =~ ^[0-9]+$ ]]; then
+      local total_blocks
+      total_blocks=$(dumpe2fs -h "$dev_path" 2>/dev/null | awk '/Block count:/{print $3}' || true)
+      if [[ -n "$total_blocks" && "$total_blocks" =~ ^[0-9]+$ ]]; then
+        local used_blocks=$((total_blocks - free_blocks))
+        echo $((used_blocks * block_size))
+        return 0
+      fi
+    fi
+  fi
+
+  # Last resort: return 0 (validation will warn about unknown usage)
+  echo "0"
 }
 
 get_max_bytes() {
@@ -842,18 +866,24 @@ confirm_operation() {
   storage=$(get_storage_for_disk "$ctid" "$disk_key")
   local stype
   stype=$(get_storage_type "$storage")
+  local used_bytes
+  used_bytes=$(get_used_bytes "$ctid" "$disk_key")
 
   local msg="Container: ${ctid} (${container_name})\n"
   msg+="Disk: ${disk_key}\n"
   msg+="Storage: ${storage} (${stype})\n"
   msg+="Current size: ${current_size}\n"
+  if ((used_bytes > 0)); then
+    msg+="Used space: $(bytes_to_human "$used_bytes")\n"
+  fi
   msg+="New size: ${target_size}\n\n"
   msg+="The container will be stopped during the operation.\n"
   msg+="Proceed?"
 
   whiptail --backtitle "Proxmox VE Helper Scripts" \
     --title "Confirm Resize" \
-    --yesno "$msg" 16 60 || exit 0
+    --yesno "$msg" 16 60 || return 1
+  return 0
 }
 
 post_operation() {
@@ -1020,6 +1050,13 @@ resize_via_copy() {
   log "STEP1_OK new_vol=$new_vol"
 
   # Step 2: Stop the container
+  if [[ -t 0 ]] && [[ "${AUTO_YES:-0}" -ne 1 ]]; then
+    if ! prompt_confirm "Container ${ctid} will be stopped. Proceed?" "y" 60; then
+      msg_info "Operation cancelled"
+      rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+      return 1
+    fi
+  fi
   msg_info "Step 2/7: Stopping container..."
   log "STEP2_STOPPING ctid=$ctid"
   stop_ct "$ctid" || {
@@ -1192,6 +1229,13 @@ resize_via_dd() {
   log "STEP1_OK new_vol=$new_vol"
 
   # Step 2: Stop the container
+  if [[ -t 0 ]] && [[ "${AUTO_YES:-0}" -ne 1 ]]; then
+    if ! prompt_confirm "Container ${ctid} will be stopped. Proceed?" "y" 60; then
+      msg_info "Operation cancelled"
+      rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+      return 1
+    fi
+  fi
   msg_info "Step 2/7: Stopping container..."
   log "STEP2_STOPPING ctid=$ctid"
   stop_ct "$ctid" || {
@@ -1412,7 +1456,9 @@ if [[ $CLI_MODE -eq 1 ]]; then
     exit 1
   fi
 
-  [[ $AUTO_YES -eq 0 ]] && confirm_operation "$CTID" "$DISK_KEY" "$TARGET_SIZE"
+  if [[ $AUTO_YES -eq 0 ]]; then
+    confirm_operation "$CTID" "$DISK_KEY" "$TARGET_SIZE" || exit 0
+  fi
 
   do_resize "$CTID" "$DISK_KEY" "$TARGET_SIZE"
   exit $?
@@ -1424,7 +1470,14 @@ CTID=$(select_container) || exit 0
 DISK_KEY=$(select_disk "$CTID") || exit 0
 DISK_KEY=$(printf '%s' "$DISK_KEY" | tr -d "'\"[:space:]")
 [[ -z "$DISK_KEY" ]] && exit 0
-TARGET_SIZE=$(get_target_size "$CTID" "$DISK_KEY") || exit 0
-[[ -z "$TARGET_SIZE" ]] && exit 0
-confirm_operation "$CTID" "$DISK_KEY" "$TARGET_SIZE" || exit 0
+
+while true; do
+  TARGET_SIZE=$(get_target_size "$CTID" "$DISK_KEY") || exit 0
+  [[ -z "$TARGET_SIZE" ]] && exit 0
+  if confirm_operation "$CTID" "$DISK_KEY" "$TARGET_SIZE"; then
+    break
+  fi
+  msg_info "Going back to size selection..."
+done
+
 do_resize "$CTID" "$DISK_KEY" "$TARGET_SIZE"
