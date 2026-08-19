@@ -641,7 +641,8 @@ select_container() {
     menu_items+=("$cid" "$desc" "OFF")
   done
 
-  msg_info "Loading containers..." >&2
+  msg_info "Loading containers..."
+  stop_spinner
   local selected
   selected=$(whiptail --backtitle "Proxmox VE Helper Scripts" \
     --title "Select Container" \
@@ -662,7 +663,8 @@ select_disk() {
     exit 1
   fi
 
-  msg_info "Loading disks..." >&2
+  msg_info "Loading disks..."
+  stop_spinner
   local menu_items=()
   while IFS= read -r line; do
     local key
@@ -712,7 +714,8 @@ get_target_size() {
     default_size=1
   fi
 
-  msg_info "Calculating disk usage..." >&2
+  msg_info "Calculating disk usage..."
+  stop_spinner
   local hint=""
   if ((used_bytes > 0)); then
     hint="Current: $(bytes_to_human "$max_bytes") | Used: $(bytes_to_human "$used_bytes")\nMust be > $(bytes_to_human "$used_bytes") and < $(bytes_to_human "$max_bytes")"
