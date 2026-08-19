@@ -24,6 +24,19 @@ fi
 load_functions
 catch_errors
 
+# Override community error_handler — resize tool should not offer container removal
+error_handler() {
+  local exit_code=${1:-$?}
+  local cmd=${2:-${BASH_COMMAND:-unknown}}
+  local line=${BASH_LINENO[0]:-unknown}
+  stop_spinner 2>/dev/null || true
+  msg_error "in line ${line}: exit code ${exit_code} — ${cmd}"
+  log "ERROR exit=$exit_code line=$line cmd=$cmd"
+  allow_interrupts 2>/dev/null || true
+  exit "$exit_code"
+}
+trap error_handler ERR
+
 set -Eeuo pipefail
 export PERL_BADLANG=0
 
@@ -68,7 +81,7 @@ trap trap_exit INT TERM
 # =============================================================================
 
 function header_info() {
-  clear
+  [[ -t 1 ]] && clear
   cat <<"EOF"
     _   ___  ________   ____       __     __
    / | / / / /_  __/  / __ \___  / /__  / /____
@@ -84,12 +97,28 @@ EOF
 spin_wait() {
   local pid=$1
   local msg=${2:-"Working"}
+  color_spinner
   SPINNER_MSG="$msg"
   spinner &
   local spid=$!
   SPINNER_PID=$spid
   wait "$pid"
   stop_spinner
+}
+
+# Unlock a container. Uses pct unlock with retry.
+unlock_ct() {
+  local ctid=$1
+  local attempt=0
+  local max_attempts=5
+  while ((attempt < max_attempts)); do
+    if pct unlock "$ctid" 2>/dev/null; then
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  return 1
 }
 
 # =============================================================================
@@ -106,6 +135,60 @@ pct_cfg()   { _pct pct config "$@"; }
 pct_st()    { _pct pct status "$@"; }
 pct_ls()    { _pct pct list; }
 pct_dsk()   { _pct pct df "$@"; }
+
+# =============================================================================
+# Container lifecycle helpers
+# =============================================================================
+
+# Stop a container and wait for it to fully stop (timeout 60s).
+stop_ct() {
+  local ctid=$1
+  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
+    pct stop "$ctid" &
+    spin_wait $! "Stopping container"
+  fi
+  local wait_sec=0
+  while [[ "$(pct_st "$ctid")" == "status: running" ]]; do
+    sleep 1
+    wait_sec=$((wait_sec + 1))
+    if ((wait_sec >= 60)); then
+      msg_error "Container did not stop within 60 seconds"
+      return 1
+    fi
+  done
+  sleep 3
+}
+
+# Start a container and wait for it to reach running state (timeout 30s).
+start_ct() {
+  local ctid=$1
+  pct start "$ctid" &
+  spin_wait $! "Starting container"
+  local wait_sec=0
+  while [[ "$(pct_st "$ctid")" != "status: running" ]]; do
+    sleep 2
+    wait_sec=$((wait_sec + 2))
+    if ((wait_sec >= 30)); then
+      break
+    fi
+  done
+}
+
+# Get the config line for a disk key from pct config (single call, cached).
+get_disk_config_line() {
+  local ctid=$1
+  local disk_key=$2
+  pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}"
+}
+
+# Resolve storage mount point for dir/nfs/cifs from storage.cfg.
+resolve_storage_path() {
+  local storage="$1"
+  awk -v st="$storage" '
+    /^(dir|nfs|cifs):/ { match_name = ($2 == st) }
+    match_name && /^[\t ]+path / { print $2; exit }
+  ' /etc/pve/storage.cfg 2>/dev/null
+}
 
 # =============================================================================
 # Size conversion helpers
@@ -188,29 +271,22 @@ get_zfs_dataset() {
 get_volume_name() {
   local ctid=$1
   local disk_key=$2
-  local config_line
-  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
-  echo "$config_line" | cut -d: -f3 | cut -d, -f1
+  get_disk_config_line "$ctid" "$disk_key" | cut -d: -f3 | cut -d, -f1
 }
 
 # Extract the storage ID for a given disk key from the container config.
-# Config format: "rootfs: local-zfs:subvol-999-disk-0,size=4G"
 # Returns: "local-zfs"
 get_storage_for_disk() {
   local ctid=$1
   local disk_key=$2
-  local config_line
-  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
-  echo "$config_line" | awk -F": " '{print $2}' | cut -d: -f1
+  get_disk_config_line "$ctid" "$disk_key" | awk -F": " '{print $2}' | cut -d: -f1
 }
 
 # Extract the declared size string (e.g. "4G") from the container config.
 get_size_from_config() {
   local ctid=$1
   local disk_key=$2
-  local config_line
-  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
-  echo "$config_line" | grep -oP 'size=\K[^ ,]+'
+  get_disk_config_line "$ctid" "$disk_key" | grep -oP 'size=\K[^ ,]+'
 }
 
 # Return the actually-used bytes for a disk, as reported by `pct df`.
@@ -282,7 +358,22 @@ get_device_path() {
       echo "/dev/zvol/${zfs_pool}/${vol_name}"
       ;;
     dir|nfs|cifs)
-      pvesm path "$vol" 2>/dev/null
+      local vol_path
+      vol_path=$(pvesm path "$vol" 2>/dev/null) || true
+      if [[ -z "$vol_path" ]]; then
+        local vol_name_path="${vol#*:}"
+        local ctid_num="${ctid:-0}"
+        local mount_point
+        mount_point=$(resolve_storage_path "$storage")
+        if [[ -n "$mount_point" ]]; then
+          if [[ "$vol_name_path" == "${ctid_num}/"* ]]; then
+            vol_path="${mount_point}/images/${vol_name_path}"
+          else
+            vol_path="${mount_point}/images/${ctid_num}/${vol_name_path}"
+          fi
+        fi
+      fi
+      echo "$vol_path"
       ;;
     *)
       echo ""
@@ -340,14 +431,20 @@ create_new_volume() {
       echo "${storage}:${new_vol}"
       ;;
     dir|nfs|cifs)
-      local new_vol="vm-${ctid}-disk-new.raw"
-      local storage_path
-      storage_path=$(pvesm path "${storage}:${new_vol}" 2>/dev/null)
+      local new_vol="${ctid}/vm-${ctid}-disk-${next_disk}.raw"
+      local storage_path=""
+      storage_path=$(pvesm path "${storage}:${new_vol}" 2>/dev/null) || true
+      # For new volumes, pvesm path fails — build path from storage config
       if [[ -z "$storage_path" ]]; then
-        local pvesm_error
-        pvesm_error=$(pvesm path "${storage}:${new_vol}" 2>&1) || true
-        msg_error "Failed to resolve path for new volume: ${pvesm_error}"
-        log "ERROR pvesm_path storage=$storage vol=$new_vol error=$pvesm_error"
+        local mount_point
+        mount_point=$(resolve_storage_path "$storage")
+        if [[ -n "$mount_point" ]]; then
+          storage_path="${mount_point}/images/${ctid}/${new_vol}"
+        fi
+      fi
+      if [[ -z "$storage_path" ]]; then
+        msg_error "Failed to resolve path for new volume"
+        log "ERROR pvesm_path storage=$storage vol=$new_vol"
         return 1
       fi
       mkdir -p "$(dirname "$storage_path")"
@@ -384,7 +481,7 @@ remove_volume() {
       ;;
     dir|nfs|cifs)
       local vol_path
-      vol_path=$(pvesm path "$vol" 2>/dev/null)
+      vol_path=$(pvesm path "$vol" 2>/dev/null) || true
       rm -f "$vol_path" 2>/dev/null || true
       ;;
   esac
@@ -474,24 +571,53 @@ replace_volume_in_config() {
     vol_value="${vol_value},size=${new_size}"
   fi
 
-  # Remove the old disk entry first
-  pct set "$ctid" --delete "$disk_key"
+  # Replace the disk entry — for rootfs, set directly (can't delete required option)
+  # Unlock CT first, then retry pct set
+  unlock_ct "$ctid" 2>/dev/null || true
+  local attempt=0
+  local max_attempts=10
+  local pvesm_ok=false
+  while ((attempt < max_attempts)); do
+    case $disk_key in
+      rootfs)
+        if pct set "$ctid" --rootfs "${vol_value}" 2>/dev/null; then
+          pvesm_ok=true
+          break
+        fi
+        ;;
+      mp[0-9]*)
+        local old_mp_opts
+        old_mp_opts=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {sub(/^[^ ]+ [^ ]+ [^ ]+ /, \"\"); print}" || true)
+        if [[ -n "$old_mp_opts" ]]; then
+          pct set "$ctid" -"${disk_key}" "${vol_value},${old_mp_opts}" 2>/dev/null && { pvesm_ok=true; break; }
+        else
+          pct set "$ctid" -"${disk_key}" "${vol_value}" 2>/dev/null && { pvesm_ok=true; break; }
+        fi
+        ;;
+    esac
+    attempt=$((attempt + 1))
+    unlock_ct "$ctid" 2>/dev/null || true
+    sleep 1
+  done
 
-  # Re-add with the new volume, preserving mount options for mp* keys
-  case $disk_key in
-    rootfs)
-      pct set "$ctid" --rootfs "${vol_value}"
-      ;;
-    mp[0-9]*)
-      local old_mp_opts
-      old_mp_opts=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {sub(/^[^ ]+ [^ ]+ [^ ]+ /, \"\"); print}" || true)
-      if [[ -n "$old_mp_opts" ]]; then
-        pct set "$ctid" -"${disk_key}" "${vol_value},${old_mp_opts}"
+  # Fallback: edit config file directly (bypasses pct lock for CIFS/NFS)
+  if [[ "$pvesm_ok" == "false" ]]; then
+    local conf="/etc/pve/lxc/${ctid}.conf"
+    if [[ -f "$conf" ]]; then
+      local old_line
+      old_line=$(grep "^${disk_key}:" "$conf" 2>/dev/null || true)
+      if [[ -n "$old_line" ]]; then
+        sed -i "s|^${disk_key}:.*|${disk_key}: ${vol_value}|" "$conf"
+        msg_warn "Used direct config edit (pct locked)"
+        log "WARN direct_config_edit ctid=$ctid disk=$disk_key"
       else
-        pct set "$ctid" -"${disk_key}" "${vol_value}"
+        echo "${disk_key}: ${vol_value}" >>"$conf"
       fi
-      ;;
-  esac
+    else
+      msg_error "Config file not found: ${conf}"
+      return 1
+    fi
+  fi
 }
 
 # =============================================================================
@@ -538,10 +664,7 @@ rollback_operation() {
   fi
 
   # Stop the container if it is currently running
-  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
-    pct stop "$ctid"
-    sleep 3
-  fi
+  stop_ct "$ctid" || return 1
 
   # ZFS subvol rollback: restore the original refquota value
   local storage="${old_vol%%:*}"
@@ -558,8 +681,7 @@ rollback_operation() {
       zfs set refquota="${old_size}" "$zfs_ds"
       msg_ok "refquota restored"
       log "ROLLBACK_REFQUOTA old_size=$old_size"
-      pct start "$ctid"
-      sleep 3
+      start_ct "$ctid"
       msg_ok "Rollback completed"
       log "ROLLBACK_OK CTID=$ctid"
       return 0
@@ -570,9 +692,7 @@ rollback_operation() {
   remove_volume "$new_vol"
   replace_volume_in_config "$ctid" "$disk_key" "$old_vol" "$old_size"
 
-  pct start "$ctid"
-  sleep 3
-
+  start_ct "$ctid"
   msg_ok "Rollback completed"
   log "ROLLBACK_OK CTID=$ctid"
 }
@@ -595,7 +715,7 @@ validate_inputs() {
   fi
 
   local config_line
-  config_line=$(pct_cfg "$ctid" | awk "/^${disk_key}:/ {print}")
+  config_line=$(get_disk_config_line "$ctid" "$disk_key")
   if [[ -z "$config_line" ]]; then
     msg_error "Disk '$disk_key' not found in container $ctid."
     return 1
@@ -875,10 +995,7 @@ resize_zfs_subvol() {
   # Step 1: Stop the container
   msg_info "Step 1/4: Stopping container..."
   log "STEP1_STOPPING ctid=$ctid"
-  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
-    pct stop "$ctid" &
-    spin_wait $! "Stopping container"
-  fi
+  stop_ct "$ctid" || return 1
   msg_ok "Container stopped"
   log "STEP1_OK"
 
@@ -893,9 +1010,7 @@ resize_zfs_subvol() {
   # Step 3: Start the container
   msg_info "Step 3/4: Starting container..."
   log "STEP3_STARTING ctid=$ctid"
-  pct start "$ctid" &
-  spin_wait $! "Starting container"
-  sleep 5
+  start_ct "$ctid"
   msg_ok "Container started"
   log "STEP3_OK"
 
@@ -987,10 +1102,10 @@ resize_via_dd() {
   # Step 2: Stop the container
   msg_info "Step 2/7: Stopping container..."
   log "STEP2_STOPPING ctid=$ctid"
-  if [[ "$(pct_st "$ctid")" == "status: running" ]]; then
-    pct stop "$ctid" &
-    spin_wait $! "Stopping container"
-  fi
+  stop_ct "$ctid" || {
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    return 1
+  }
   msg_ok "Container stopped"
   log "STEP2_OK"
 
@@ -1050,9 +1165,7 @@ resize_via_dd() {
   # Step 6: Start the container
   msg_info "Step 6/7: Starting container..."
   log "STEP6_STARTING ctid=$ctid"
-  pct start "$ctid" &
-  spin_wait $! "Starting container"
-  sleep 3
+  start_ct "$ctid"
   msg_ok "Container started"
   log "STEP6_OK"
 
@@ -1106,8 +1219,6 @@ do_resize() {
   msg_info "Resizing ${disk_key} on container ${ctid} from ${current_size} to ${target_size}"
   log "INFO storage_type=$stype current_size=$current_size"
 
-  local rc=0
-
   # Try ZFS subvol (refquota) path first for zfspool storage
   if [[ "$stype" == "zfspool" ]]; then
     msg_info "Probing ZFS dataset..."
@@ -1120,7 +1231,7 @@ do_resize() {
 
   # Universal dd copy path for LVM, ZFS zvol, and directory storage
   resize_via_dd "$ctid" "$disk_key" "$target_size" "$storage" "$vol_name" "$current_size"
-  rc=$?
+  local rc=$?
 
   allow_interrupts
   return $rc
