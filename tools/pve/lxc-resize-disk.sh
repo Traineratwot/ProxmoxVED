@@ -89,7 +89,6 @@ trap trap_exit INT TERM
 # 5. UI HELPERS
 # =============================================================================
 
-# Override community header_info — don't require TERM or header file
 function header_info {
   clear
   cat <<"EOF"
@@ -137,10 +136,10 @@ _pct() {
   LC_ALL=C "$@" 2>/dev/null | tr -d '\r' | sed 's/[[:space:]]*$//'
 }
 
-pct_cfg()  { _pct pct config "$@"; }
-pct_st()   { _pct pct status "$@"; }
-pct_ls()   { _pct pct list; }
-pct_dsk()  { _pct pct df "$@"; }
+pct_cfg() { _pct pct config "$@"; }
+pct_st() { _pct pct status "$@"; }
+pct_ls() { _pct pct list; }
+pct_dsk() { _pct pct df "$@"; }
 
 # =============================================================================
 # 7. CONTAINER LIFECYCLE HELPERS
@@ -203,12 +202,12 @@ parse_size_to_bytes() {
   local unit="${size##*[0-9]}"
   unit="${unit^^}"
   case "$unit" in
-    T) awk "BEGIN { printf \"%.0f\", $num * 1024 * 1024 * 1024 * 1024 }" ;;
-    G) awk "BEGIN { printf \"%.0f\", $num * 1024 * 1024 * 1024 }" ;;
-    M) awk "BEGIN { printf \"%.0f\", $num * 1024 * 1024 }" ;;
-    K) awk "BEGIN { printf \"%.0f\", $num * 1024 }" ;;
-    B|"") echo "$num" ;;
-    *) echo "0" ;;
+  T) awk "BEGIN { printf \"%.0f\", $num * 1024 * 1024 * 1024 * 1024 }" ;;
+  G) awk "BEGIN { printf \"%.0f\", $num * 1024 * 1024 * 1024 }" ;;
+  M) awk "BEGIN { printf \"%.0f\", $num * 1024 * 1024 }" ;;
+  K) awk "BEGIN { printf \"%.0f\", $num * 1024 }" ;;
+  B | "") echo "$num" ;;
+  *) echo "0" ;;
   esac
 }
 
@@ -342,37 +341,37 @@ get_device_path() {
   storage_type=$(get_storage_type "$storage")
 
   case $storage_type in
-    lvmthin|lvm)
-      local vg_name
-      vg_name=$(resolve_vg_name "$vol_name")
-      echo "/dev/${vg_name}/${vol_name}"
-      ;;
-    zfs)
-      local zfs_pool
-      zfs_pool=$(get_zfs_pool "$storage")
-      echo "/dev/zvol/${zfs_pool}/${vol_name}"
-      ;;
-    dir|nfs|cifs)
-      local vol_path
-      vol_path=$(pvesm path "$vol" 2>/dev/null) || true
-      if [[ -z "$vol_path" ]]; then
-        local vol_name_path="${vol#*:}"
-        local ctid_num="${ctid:-0}"
-        local mount_point
-        mount_point=$(resolve_storage_path "$storage")
-        if [[ -n "$mount_point" ]]; then
-          if [[ "$vol_name_path" == "${ctid_num}/"* ]]; then
-            vol_path="${mount_point}/images/${vol_name_path}"
-          else
-            vol_path="${mount_point}/images/${ctid_num}/${vol_name_path}"
-          fi
+  lvmthin | lvm)
+    local vg_name
+    vg_name=$(resolve_vg_name "$vol_name")
+    echo "/dev/${vg_name}/${vol_name}"
+    ;;
+  zfs)
+    local zfs_pool
+    zfs_pool=$(get_zfs_pool "$storage")
+    echo "/dev/zvol/${zfs_pool}/${vol_name}"
+    ;;
+  dir | nfs | cifs)
+    local vol_path
+    vol_path=$(pvesm path "$vol" 2>/dev/null) || true
+    if [[ -z "$vol_path" ]]; then
+      local vol_name_path="${vol#*:}"
+      local ctid_num="${ctid:-0}"
+      local mount_point
+      mount_point=$(resolve_storage_path "$storage")
+      if [[ -n "$mount_point" ]]; then
+        if [[ "$vol_name_path" == "${ctid_num}/"* ]]; then
+          vol_path="${mount_point}/images/${vol_name_path}"
+        else
+          vol_path="${mount_point}/images/${ctid_num}/${vol_name_path}"
         fi
       fi
-      echo "$vol_path"
-      ;;
-    *)
-      echo ""
-      ;;
+    fi
+    echo "$vol_path"
+    ;;
+  *)
+    echo ""
+    ;;
   esac
 }
 
@@ -406,44 +405,44 @@ create_new_volume() {
   next_disk=$(get_next_disk_number "$ctid")
 
   case $storage_type in
-    lvmthin|lvm)
-      local vg_name
-      vg_name=$(lvs --noheadings -o vg_name 2>/dev/null | head -1 | tr -d ' ')
-      local new_vol="vm-${ctid}-disk-${next_disk}"
-      lvcreate -L "${new_size}" -n "$new_vol" "$vg_name"
-      echo "${storage}:${new_vol}"
-      ;;
-    zfs)
-      local new_vol="subvol-${ctid}-disk-${next_disk}"
-      local zfs_ds
-      zfs_ds=$(get_zfs_dataset "$storage" "$new_vol")
-      zfs create -V "${new_size}" "$zfs_ds"
-      echo "${storage}:${new_vol}"
-      ;;
-    dir|nfs|cifs)
-      local new_vol="${ctid}/vm-${ctid}-disk-${next_disk}.raw"
-      local storage_path=""
-      storage_path=$(pvesm path "${storage}:${new_vol}" 2>/dev/null) || true
-      if [[ -z "$storage_path" ]]; then
-        local mount_point
-        mount_point=$(resolve_storage_path "$storage")
-        if [[ -n "$mount_point" ]]; then
-          storage_path="${mount_point}/images/${ctid}/${new_vol}"
-        fi
+  lvmthin | lvm)
+    local vg_name
+    vg_name=$(lvs --noheadings -o vg_name 2>/dev/null | head -1 | tr -d ' ')
+    local new_vol="vm-${ctid}-disk-${next_disk}"
+    lvcreate -L "${new_size}" -n "$new_vol" "$vg_name"
+    echo "${storage}:${new_vol}"
+    ;;
+  zfs)
+    local new_vol="subvol-${ctid}-disk-${next_disk}"
+    local zfs_ds
+    zfs_ds=$(get_zfs_dataset "$storage" "$new_vol")
+    zfs create -V "${new_size}" "$zfs_ds"
+    echo "${storage}:${new_vol}"
+    ;;
+  dir | nfs | cifs)
+    local new_vol="${ctid}/vm-${ctid}-disk-${next_disk}.raw"
+    local storage_path=""
+    storage_path=$(pvesm path "${storage}:${new_vol}" 2>/dev/null) || true
+    if [[ -z "$storage_path" ]]; then
+      local mount_point
+      mount_point=$(resolve_storage_path "$storage")
+      if [[ -n "$mount_point" ]]; then
+        storage_path="${mount_point}/images/${ctid}/${new_vol}"
       fi
-      if [[ -z "$storage_path" ]]; then
-        msg_error "Failed to resolve path for new volume"
-        log "ERROR pvesm_path storage=$storage vol=$new_vol"
-        return 1
-      fi
-      mkdir -p "$(dirname "$storage_path")"
-      truncate -s "${new_size}" "$storage_path"
-      echo "${storage}:${new_vol}"
-      ;;
-    *)
-      echo ""
+    fi
+    if [[ -z "$storage_path" ]]; then
+      msg_error "Failed to resolve path for new volume"
+      log "ERROR pvesm_path storage=$storage vol=$new_vol"
       return 1
-      ;;
+    fi
+    mkdir -p "$(dirname "$storage_path")"
+    truncate -s "${new_size}" "$storage_path"
+    echo "${storage}:${new_vol}"
+    ;;
+  *)
+    echo ""
+    return 1
+    ;;
   esac
 }
 
@@ -455,21 +454,21 @@ remove_volume() {
   storage_type=$(get_storage_type "$storage")
 
   case $storage_type in
-    lvmthin|lvm)
-      local vg_name
-      vg_name=$(resolve_vg_name "$vol_name")
-      lvremove -f "/dev/${vg_name}/${vol_name}" 2>/dev/null || true
-      ;;
-    zfs)
-      local zfs_ds
-      zfs_ds=$(get_zfs_dataset "$storage" "$vol_name")
-      zfs destroy "$zfs_ds" 2>/dev/null || true
-      ;;
-    dir|nfs|cifs)
-      local vol_path
-      vol_path=$(pvesm path "$vol" 2>/dev/null) || true
-      rm -f "$vol_path" 2>/dev/null || true
-      ;;
+  lvmthin | lvm)
+    local vg_name
+    vg_name=$(resolve_vg_name "$vol_name")
+    lvremove -f "/dev/${vg_name}/${vol_name}" 2>/dev/null || true
+    ;;
+  zfs)
+    local zfs_ds
+    zfs_ds=$(get_zfs_dataset "$storage" "$vol_name")
+    zfs destroy "$zfs_ds" 2>/dev/null || true
+    ;;
+  dir | nfs | cifs)
+    local vol_path
+    vol_path=$(pvesm path "$vol" 2>/dev/null) || true
+    rm -f "$vol_path" 2>/dev/null || true
+    ;;
   esac
 }
 
@@ -491,7 +490,7 @@ copy_data() {
   local source_size=$3
 
   local bs count
-  read -r bs count <<< "$(get_dd_params "$source_size")"
+  read -r bs count <<<"$(get_dd_params "$source_size")"
   local dd_errors
   dd_errors=$(mktemp)
   # Run dd in background with spinner, capture stderr separately
@@ -514,7 +513,7 @@ verify_checksum() {
   local source_size=$3
 
   local bs count
-  read -r bs count <<< "$(get_dd_params "$source_size")"
+  read -r bs count <<<"$(get_dd_params "$source_size")"
 
   local source_hash dest_hash
   source_hash=$(dd if="$source_dev" bs="$bs" count="$count" 2>/dev/null | md5sum | awk '{print $1}')
@@ -551,21 +550,27 @@ replace_volume_in_config() {
   local pvesm_ok=false
   while ((attempt < max_attempts)); do
     case $disk_key in
-      rootfs)
-        if pct set "$ctid" --rootfs "${vol_value}" 2>/dev/null; then
+    rootfs)
+      if pct set "$ctid" --rootfs "${vol_value}" 2>/dev/null; then
+        pvesm_ok=true
+        break
+      fi
+      ;;
+    mp[0-9]*)
+      local old_mp_opts
+      old_mp_opts=$(pct_cfg "$ctid" | awk -v dk="$disk_key" '$0 ~ "^"dk":" {sub(/^[^ ]+ [^ ]+ [^ ]+ /, ""); print}' || true)
+      if [[ -n "$old_mp_opts" ]]; then
+        pct set "$ctid" -"${disk_key}" "${vol_value},${old_mp_opts}" 2>/dev/null && {
           pvesm_ok=true
           break
-        fi
-        ;;
-      mp[0-9]*)
-        local old_mp_opts
-        old_mp_opts=$(pct_cfg "$ctid" | awk -v dk="$disk_key" '$0 ~ "^"dk":" {sub(/^[^ ]+ [^ ]+ [^ ]+ /, ""); print}' || true)
-        if [[ -n "$old_mp_opts" ]]; then
-          pct set "$ctid" -"${disk_key}" "${vol_value},${old_mp_opts}" 2>/dev/null && { pvesm_ok=true; break; }
-        else
-          pct set "$ctid" -"${disk_key}" "${vol_value}" 2>/dev/null && { pvesm_ok=true; break; }
-        fi
-        ;;
+        }
+      else
+        pct set "$ctid" -"${disk_key}" "${vol_value}" 2>/dev/null && {
+          pvesm_ok=true
+          break
+        }
+      fi
+      ;;
     esac
     attempt=$((attempt + 1))
     unlock_ct "$ctid" 2>/dev/null || true
@@ -903,19 +908,19 @@ post_operation() {
     3>&1 1>&2 2>&3) || choice="2"
 
   case "$choice" in
-    1)
-      msg_info "Deleting old volume..."
-      remove_volume "$old_vol"
-      msg_ok "Old volume deleted"
-      log "POST_DELETE old_vol=$old_vol"
-      ;;
-    3)
-      rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
-      ;;
-    *)
-      msg_info "Old volume kept"
-      log "POST_KEEP old_vol=$old_vol"
-      ;;
+  1)
+    msg_info "Deleting old volume..."
+    remove_volume "$old_vol"
+    msg_ok "Old volume deleted"
+    log "POST_DELETE old_vol=$old_vol"
+    ;;
+  3)
+    rollback_operation "$ctid" "$disk_key" "$old_vol" "$new_vol"
+    ;;
+  *)
+    msg_info "Old volume kept"
+    log "POST_KEEP old_vol=$old_vol"
+    ;;
   esac
 }
 
@@ -1434,13 +1439,34 @@ AUTO_ROLLBACK=0
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    -d | --ctid) CTID="$2"; shift 2 ;;
-    -k | --disk) DISK_KEY="$2"; shift 2 ;;
-    -s | --size) TARGET_SIZE="$2"; shift 2 ;;
-    -y | --yes) AUTO_YES=1; shift ;;
-    -r | --rollback) AUTO_ROLLBACK=1; shift ;;
-    -h | --help) show_help; exit 0 ;;
-    *) msg_error "Unknown option: $1"; exit 1 ;;
+  -d | --ctid)
+    CTID="$2"
+    shift 2
+    ;;
+  -k | --disk)
+    DISK_KEY="$2"
+    shift 2
+    ;;
+  -s | --size)
+    TARGET_SIZE="$2"
+    shift 2
+    ;;
+  -y | --yes)
+    AUTO_YES=1
+    shift
+    ;;
+  -r | --rollback)
+    AUTO_ROLLBACK=1
+    shift
+    ;;
+  -h | --help)
+    show_help
+    exit 0
+    ;;
+  *)
+    msg_error "Unknown option: $1"
+    exit 1
+    ;;
   esac
 done
 
